@@ -18,6 +18,7 @@ from google.api_core.exceptions import ResourceExhausted
 from tenacity import (
     retry,
     retry_if_exception_type,
+    stop_after_attempt,
     wait_random_exponential,
 )
 from vertexai.generative_models import (
@@ -27,9 +28,12 @@ from vertexai.generative_models import (
     GenerativeModel,
     Part,
     Tool,
+    GenerationResponse
 )
 
 logging.basicConfig(level=logging.INFO)
+import requests
+import json
 
 class GeminiHandler(BaseHandler):
     def __init__(self, model_name, temperature) -> None:
@@ -79,6 +83,7 @@ class GeminiHandler(BaseHandler):
 
     @retry(
         wait=wait_random_exponential(min=6, max=120),
+        # stop=stop_after_attempt(10),
         retry=retry_if_exception_type(ResourceExhausted),
         before_sleep=lambda retry_state: print(
             f"Attempt {retry_state.attempt_number} failed. Sleeping for {float(round(retry_state.next_action.sleep, 2))} seconds before retrying..."
@@ -86,7 +91,36 @@ class GeminiHandler(BaseHandler):
         ),
     )
     def generate_with_backoff(self, client, **kwargs):
-        return client.generate_content(**kwargs)
+        # return client.generate_content(**kwargs)
+        contents = kwargs.get('contents')
+        tools = kwargs.get('tools')
+        inference_data = kwargs.get('inference_data')
+
+        request = client._prepare_request(
+            contents=contents,
+            generation_config=GenerationConfig(
+                temperature=self.temperature,
+            ),
+            tools=tools if len(tools) > 0 else None,
+        )
+
+        api_response = requests.post("http://localhost:8080/", data=request._pb.SerializeToString(), headers={'Content-Type': 'application/x-protobuf'})
+        response = json.loads(api_response.content)['response']
+        if 'DEADLINE_EXCEEDED' in response or "RESOURCE_EXHAUSTED:" in response:
+            raise ResourceExhausted(response)
+
+        content = json.loads(api_response.content)
+        raw_response = content['raw_response']
+        flattext = content['flattext']
+        inference_data["inference_input_log"]['raw_response'] = raw_response
+        inference_data["inference_input_log"]["flattext"] = flattext
+        inference_data["inference_input_log"]["request"] = type(request).serialize(request)
+
+        if api_response.status_code != 200: 
+            raise ValueError(content["response"])
+        else:
+            api_response = GenerationResponse.from_dict(json.loads(content["response"]))
+        return api_response
 
     #### FC methods ####
 
@@ -103,18 +137,13 @@ class GeminiHandler(BaseHandler):
                 )
             )
 
-        if func_declarations:
-            tools = [Tool(function_declarations=func_declarations)]
-        else:
-            tools = None
+        tools = [Tool(function_declarations=func_declarations)]
 
         inference_data["inference_input_log"] = {
             "message": repr(inference_data["message"]),
             "tools": inference_data["tools"],
             "system_prompt": inference_data.get("system_prompt", None),
         }
-
-        # messages are already converted to Content object
         if "system_prompt" in inference_data:
             # We re-instantiate the GenerativeModel object with the system prompt
             # We cannot reassign the self.client object as it will affect other entries
@@ -124,15 +153,17 @@ class GeminiHandler(BaseHandler):
             )
         else:
             client = self.client
-
+        
         api_response = self.generate_with_backoff(
             client=client,
             contents=inference_data["message"],
             generation_config=GenerationConfig(
                 temperature=self.temperature,
             ),
-            tools=tools
+            inference_data=inference_data,
+            tools=tools if len(tools) > 0 else None,
         )
+
         return api_response
 
     def _pre_query_processing_FC(self, inference_data: dict, test_entry: dict) -> dict:
@@ -179,14 +210,6 @@ class GeminiHandler(BaseHandler):
                 text_parts.append(part.text)
 
         model_responses = fc_parts if fc_parts else text_parts
-        
-        if len(api_response.candidates[0].content.parts) == 0:
-            response_function_call_content = Content(
-                role="model",
-                parts=[
-                    Part.from_text("The model did not return any response."),
-                ],
-            )
 
         return {
             "model_responses": model_responses,
@@ -218,9 +241,10 @@ class GeminiHandler(BaseHandler):
     def _add_assistant_message_FC(
         self, inference_data: dict, model_response_data: dict
     ) -> dict:
-        inference_data["message"].append(
-            model_response_data["model_responses_message_for_chat_history"]
-        )
+        if len(model_response_data["model_responses_message_for_chat_history"].parts):
+            inference_data["message"].append(
+                model_response_data["model_responses_message_for_chat_history"]
+            )
         return inference_data
 
     def _add_execution_results_FC(
@@ -257,7 +281,6 @@ class GeminiHandler(BaseHandler):
             "system_prompt": inference_data.get("system_prompt", None),
         }
 
-        # messages are already converted to Content object
         if "system_prompt" in inference_data:
             client = GenerativeModel(
                 self.model_name.replace("-FC", ""),
