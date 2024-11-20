@@ -18,7 +18,6 @@ from google.api_core.exceptions import ResourceExhausted
 from tenacity import (
     retry,
     retry_if_exception_type,
-    stop_after_attempt,
     wait_random_exponential,
 )
 from vertexai.generative_models import (
@@ -83,7 +82,6 @@ class GeminiHandler(BaseHandler):
 
     @retry(
         wait=wait_random_exponential(min=6, max=120),
-        # stop=stop_after_attempt(10),
         retry=retry_if_exception_type(ResourceExhausted),
         before_sleep=lambda retry_state: print(
             f"Attempt {retry_state.attempt_number} failed. Sleeping for {float(round(retry_state.next_action.sleep, 2))} seconds before retrying..."
@@ -91,7 +89,6 @@ class GeminiHandler(BaseHandler):
         ),
     )
     def generate_with_backoff(self, client, **kwargs):
-        # return client.generate_content(**kwargs)
         contents = kwargs.get('contents')
         tools = kwargs.get('tools')
         inference_data = kwargs.get('inference_data')
@@ -137,13 +134,18 @@ class GeminiHandler(BaseHandler):
                 )
             )
 
-        tools = [Tool(function_declarations=func_declarations)]
+        if func_declarations:
+            tools = [Tool(function_declarations=func_declarations)]
+        else:
+            tools = None
 
         inference_data["inference_input_log"] = {
             "message": repr(inference_data["message"]),
             "tools": inference_data["tools"],
             "system_prompt": inference_data.get("system_prompt", None),
         }
+
+        # messages are already converted to Content object
         if "system_prompt" in inference_data:
             # We re-instantiate the GenerativeModel object with the system prompt
             # We cannot reassign the self.client object as it will affect other entries
