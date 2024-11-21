@@ -163,7 +163,7 @@ class GeminiHandler(BaseHandler):
                 temperature=self.temperature,
             ),
             inference_data=inference_data,
-            tools=tools if len(tools) > 0 else None,
+            tools=tools,
         )
 
         return api_response
