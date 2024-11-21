@@ -103,7 +103,7 @@ class GeminiHandler(BaseHandler):
 
         api_response = requests.post("http://localhost:8080/", data=request._pb.SerializeToString(), headers={'Content-Type': 'application/x-protobuf'})
         response = json.loads(api_response.content)['response']
-        if 'DEADLINE_EXCEEDED' in response or "RESOURCE_EXHAUSTED:" in response:
+        if 'DEADLINE_EXCEEDED' in response or "RESOURCE_EXHAUSTED" in response or 'OVERLOADED' in response:
             raise ResourceExhausted(response)
 
         content = json.loads(api_response.content)
