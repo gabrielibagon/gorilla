@@ -98,7 +98,7 @@ class GeminiHandler(BaseHandler):
             generation_config=GenerationConfig(
                 temperature=self.temperature,
             ),
-            tools=tools if len(tools) > 0 else None,
+            tools=tools,
         )
 
         api_response = requests.post("http://localhost:8080/", data=request._pb.SerializeToString(), headers={'Content-Type': 'application/x-protobuf'})
