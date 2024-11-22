@@ -155,7 +155,7 @@ class GeminiHandler(BaseHandler):
             )
         else:
             client = self.client
-        
+
         api_response = self.generate_with_backoff(
             client=client,
             contents=inference_data["message"],
@@ -296,6 +296,7 @@ class GeminiHandler(BaseHandler):
             generation_config=GenerationConfig(
                 temperature=self.temperature,
             ),
+            inference_data=inference_data,
         )
         return api_response
 
