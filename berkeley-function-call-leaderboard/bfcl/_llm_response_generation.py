@@ -1,23 +1,30 @@
 import argparse
-import copy
 import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 
 from bfcl._apply_function_credential_config import apply_function_credential_config
 from bfcl.constant import (
     MULTI_TURN_FUNC_DOC_FILE_MAPPING,
     MULTI_TURN_FUNC_DOC_PATH,
+    PROJECT_ROOT,
     PROMPT_PATH,
     RESULT_PATH,
-    TEST_COLLECTION_MAPPING,
     TEST_FILE_MAPPING,
+    TEST_IDS_TO_GENERATE_PATH,
 )
 from bfcl.eval_checker.eval_runner_helper import load_file
 from bfcl.model_handler.handler_map import HANDLER_MAP
 from bfcl.model_handler.model_style import ModelStyle
-from bfcl.utils import is_executable, is_multi_turn
+from bfcl.utils import (
+    check_api_key_supplied,
+    is_executable,
+    is_multi_turn,
+    parse_test_category_argument,
+    sort_key,
+)
 from tqdm import tqdm
 
 RETRY_LIMIT = 3
@@ -28,22 +35,28 @@ RETRY_DELAY = 65  # Delay in seconds
 def get_args():
     parser = argparse.ArgumentParser()
     # Refer to model_choice for supported models.
-    parser.add_argument(
-        "--model", type=str, default="gorilla-openfunctions-v2", nargs="+"
-    )
+    parser.add_argument("--model", type=str, default="gorilla-openfunctions-v2", nargs="+")
     # Refer to test_categories for supported categories.
-    parser.add_argument(
-        "--test-category", type=str, default="all", nargs="+"
-    )
+    parser.add_argument("--test-category", type=str, default="all", nargs="+")
 
     # Parameters for the model that you want to test.
     parser.add_argument("--temperature", type=float, default=0.001)
     parser.add_argument("--include-input-log", action="store_true", default=False)
-    parser.add_argument("--include-state-log", action="store_true", default=False)
+    parser.add_argument("--exclude-state-log", action="store_true", default=False)
     parser.add_argument("--num-threads", default=1, type=int)
     parser.add_argument("--num-gpus", default=1, type=int)
     parser.add_argument("--backend", default="vllm", type=str, choices=["vllm", "sglang"])
     parser.add_argument("--gpu-memory-utilization", default=0.9, type=float)
+    parser.add_argument("--result-dir", default=None, type=str)
+    parser.add_argument("--run-ids", action="store_true", default=False)
+    parser.add_argument("--allow-overwrite", "-o", action="store_true", default=False)
+    # Add the new skip_vllm argument
+    parser.add_argument(
+        "--skip-server-setup",
+        action="store_true",
+        default=False,
+        help="Skip vLLM/SGLang server setup and use existing endpoint specified by the VLLM_ENDPOINT and VLLM_PORT environment variables."
+    )
     args = parser.parse_args()
     return args
 
@@ -53,82 +66,92 @@ def build_handler(model_name, temperature):
     return handler
 
 
-def sort_key(entry):
-    """
-    Index comes in two forms: TestCategory_Index or TestCategory_Index-FuncDocSubIndex-PromptSubIndex; both 0-indexed.
+def get_involved_test_entries(test_category_args, run_ids):
+    all_test_file_paths, all_test_categories, all_test_entries_involved = [], [], []
+    api_key_supplied = check_api_key_supplied()
+    skipped_categories = []
+    if run_ids:
+        with open(TEST_IDS_TO_GENERATE_PATH) as f:
+            test_ids_to_generate = json.load(f)
+        for category, test_ids in test_ids_to_generate.items():
+            if len(test_ids) == 0:
+                continue
+            test_file_path = TEST_FILE_MAPPING[category]
+            all_test_entries_involved.extend(
+                [
+                    entry
+                    for entry in load_file(PROMPT_PATH / test_file_path)
+                    if entry["id"] in test_ids
+                ]
+            )
+            # Skip executable test category if api key is not provided in the .env file
+            if is_executable(category) and not api_key_supplied:
+                skipped_categories.append(category)
+            else:
+                all_test_categories.append(category)
+                all_test_file_paths.append(test_file_path)
 
-    TestCategory_Index: For example, `simple_20` means the 21st entry in the `simple` test category.
+    else:
+        all_test_file_paths, all_test_categories = parse_test_category_argument(test_category_args)
+        # Make a copy here since we are removing list elemenets inside the for loop
+        for test_category, file_to_open in zip(
+            all_test_categories[:], all_test_file_paths[:]
+        ):
+            if is_executable(test_category) and not api_key_supplied:
+                all_test_categories.remove(test_category)
+                all_test_file_paths.remove(file_to_open)
+                skipped_categories.append(test_category)
+            else:
+                all_test_entries_involved.extend(load_file(PROMPT_PATH / file_to_open))
 
-    TestCategory_Index-FuncDocSubIndex-PromptSubIndex is used when there are multiple prompts for a single function doc; this only happens in the live dataset.
-    FuncDocSubIndex increments for each unique function doc.
-    PromptSubIndex is per function doc. It resets to 0 for each function doc.
-        For example, `live_simple_19-3-15` means the 20th entry in the `live_simple` test category.
-        This entry has the 4th unique function doc and the 16th prompt for that function doc (there are at least 15 other prompts for this same function doc in this category).
-
-    In either case, the universal index is enough to sort the entries.
-    """
-    parts = entry["id"].rsplit("_", 1)
-    test_category, index = parts[0], parts[1]
-    # This handles the case where the index is in the form TestCategory_Index-FuncDocSubIndex-PromptSubIndex
-    if "-" in index:
-        index = index.split("-")[0]
-    return (test_category, int(index))
-
-
-def parse_test_category_argument(test_category_args):
-    test_name_total = set()
-    test_filename_total = set()
-
-    for test_category in test_category_args:
-        if test_category in TEST_COLLECTION_MAPPING:
-            for test_name in TEST_COLLECTION_MAPPING[test_category]:
-                test_name_total.add(test_name)
-                test_filename_total.add(TEST_FILE_MAPPING[test_name])
-        else:
-            test_name_total.add(test_category)
-            test_filename_total.add(TEST_FILE_MAPPING[test_category])
-
-    return sorted(list(test_name_total)), sorted(list(test_filename_total))
+    return (
+        all_test_file_paths,
+        all_test_categories,
+        all_test_entries_involved,
+        skipped_categories,
+    )
 
 
-def collect_test_cases(test_name_total, test_filename_total, model_name):
+def collect_test_cases(
+    args, model_name, all_test_categories, all_test_file_paths, all_test_entries_involved
+):
     model_name_dir = model_name.replace("/", "_")
-    model_result_dir = RESULT_PATH / model_name_dir
+    model_result_dir = args.result_dir / model_name_dir
 
-    test_cases_total = []
-    for test_category, file_to_open in zip(test_name_total, test_filename_total):
-        test_cases = []
-        with open(PROMPT_PATH / file_to_open) as f:
-            for line in f:
-                test_cases.append(json.loads(line))
+    existing_result = []
+    for test_category, file_to_open in zip(all_test_categories, all_test_file_paths):
 
-        existing_result = []
         result_file_path = model_result_dir / file_to_open.replace(".json", "_result.json")
         if result_file_path.exists():
-            with open(result_file_path) as f:
-                for line in f:
-                    existing_result.append(json.loads(line))
+            # Not allowing overwrite, we will load the existing results
+            if not args.allow_overwrite:
+                existing_result.extend(load_file(result_file_path))
+            # Allow overwrite and not running specific test ids, we will delete the existing result file before generating new results
+            elif not args.run_ids:
+                result_file_path.unlink()
+            # Allow overwrite and running specific test ids, we will do nothing here
+            else:
+                pass
 
         existing_ids = [entry["id"] for entry in existing_result]
-        test_cases_to_generate = [
-            test_case for test_case in test_cases if test_case["id"] not in existing_ids
-        ]
-        test_cases_to_generate = process_multi_turn_test_case(
-            test_cases_to_generate, test_category
-        )
 
-        test_cases_total.extend(test_cases_to_generate)
+    test_cases_to_generate = [
+        test_case
+        for test_case in all_test_entries_involved
+        if test_case["id"] not in existing_ids
+    ]
+    test_cases_to_generate = process_multi_turn_test_case(test_cases_to_generate)
 
-    return sorted(test_cases_total, key=sort_key)
+    return sorted(test_cases_to_generate, key=sort_key)
 
 
-def process_multi_turn_test_case(test_cases, test_category):
+def process_multi_turn_test_case(test_cases):
     """
     Multi-turn test cases don't have the function doc in the prompt. We need to add them here.
     """
-    if not is_multi_turn(test_category):
-        return test_cases
     for entry in test_cases:
+        if not is_multi_turn(entry["id"]):
+            continue
         involved_classes = entry["involved_classes"]
         entry["function"] = []
         for func_collection in involved_classes:
@@ -154,7 +177,7 @@ def process_multi_turn_test_case(test_cases, test_category):
     return test_cases
 
 
-def multi_threaded_inference(handler, test_case, include_input_log, include_state_log):
+def multi_threaded_inference(handler, test_case, include_input_log, exclude_state_log):
 
     assert type(test_case["function"]) is list
 
@@ -163,7 +186,7 @@ def multi_threaded_inference(handler, test_case, include_input_log, include_stat
     while True:
         try:
             result, metadata = handler.inference(
-                copy.deepcopy(test_case), include_input_log, include_state_log
+                deepcopy(test_case), include_input_log, exclude_state_log
             )
             break  # Success, exit the loop
         except Exception as e:
@@ -206,7 +229,7 @@ def multi_threaded_inference(handler, test_case, include_input_log, include_stat
 
 
 def generate_results(args, model_name, test_cases_total):
-
+    update_mode = args.allow_overwrite
     handler = build_handler(model_name, args.temperature)
 
     if handler.model_style == ModelStyle.OSSMODEL:
@@ -216,8 +239,11 @@ def generate_results(args, model_name, test_cases_total):
             num_gpus=args.num_gpus,
             gpu_memory_utilization=args.gpu_memory_utilization,
             backend=args.backend,
+            skip_server_setup=args.skip_server_setup,
             include_input_log=args.include_input_log,
-            include_state_log=args.include_state_log,
+            exclude_state_log=args.exclude_state_log,
+            result_dir=args.result_dir,
+            update_mode=update_mode,
         )
 
     else:
@@ -233,14 +259,16 @@ def generate_results(args, model_name, test_cases_total):
                         handler,
                         test_case,
                         args.include_input_log,
-                        args.include_state_log,
+                        args.exclude_state_log,
                     )
                     futures.append(future)
 
                 for future in futures:
                     # This will wait for the task to complete, so that we are always writing in order
                     result = future.result()
-                    handler.write(result)
+                    handler.write(
+                        result, result_dir=args.result_dir, update_mode=args.run_ids
+                    )  # Only when we run specific test ids, we will need update_mode=True to keep entries in the same order
                     pbar.update()
 
 
@@ -251,23 +279,43 @@ def main(args):
     if type(args.test_category) is not list:
         args.test_category = [args.test_category]
 
-    test_name_total, test_filename_total = parse_test_category_argument(args.test_category)
+    (
+        all_test_file_paths,
+        all_test_categories,
+        all_test_entries_involved,
+        skipped_categories,
+    ) = get_involved_test_entries(args.test_category, args.run_ids)
 
-    print(f"Generating results for {args.model} on test category: {test_name_total}.")
+    print(f"Generating results for {args.model}")
+    if args.run_ids:
+        print("Running specific test cases. Ignoring `--test-category` argument.")
+    else:
+        print(f"Running full test cases for categories: {all_test_categories}.")
+
+    if len(skipped_categories) > 0:
+        print("----------")
+        print(
+            f"❗️ Note: The following executable test category entries will be skipped because they require API Keys to be provided in the .env file: {skipped_categories}.\n Please refer to the README.md 'API Keys for Executable Test Categories' section for details.\n The model response for other categories will still be generated."
+        )
+        print("----------")
 
     # Apply function credential config if any of the test categories are executable
-    if any([is_executable(category) for category in test_name_total]):
+    # We can know for sure that any executable categories will not be included if the API Keys are not supplied.
+    if any([is_executable(category) for category in all_test_categories]):
         apply_function_credential_config(input_path=PROMPT_PATH)
 
-    for model_name in args.model:
-        if (
-            os.getenv("USE_COHERE_OPTIMIZATION") == "True"
-            and "command-r-plus" in model_name
-        ):
-            model_name = model_name + "-optimized"
+    if args.result_dir is not None:
+        args.result_dir = PROJECT_ROOT / args.result_dir
+    else:
+        args.result_dir = RESULT_PATH
 
+    for model_name in args.model:
         test_cases_total = collect_test_cases(
-            test_name_total, test_filename_total, model_name
+            args,
+            model_name,
+            all_test_categories,
+            all_test_file_paths,
+            all_test_entries_involved,
         )
 
         if len(test_cases_total) == 0:
