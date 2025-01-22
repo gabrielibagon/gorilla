@@ -23,6 +23,7 @@ from vertexai.generative_models import (
     GenerativeModel,
     Part,
     Tool,
+    GenerationResponse
 )
 import requests
 import json
