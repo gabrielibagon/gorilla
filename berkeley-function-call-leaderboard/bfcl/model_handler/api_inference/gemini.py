@@ -24,6 +24,8 @@ from vertexai.generative_models import (
     Part,
     Tool,
 )
+import requests
+import json
 
 
 class GeminiHandler(BaseHandler):
@@ -74,10 +76,38 @@ class GeminiHandler(BaseHandler):
 
     @retry_with_backoff(error_type=ResourceExhausted)
     def generate_with_backoff(self, client, **kwargs):
-        start_time = time.time()
-        api_response = client.generate_content(**kwargs)
-        end_time = time.time()
 
+        contents = kwargs.get('contents')
+        tools = kwargs.get('tools')
+        inference_data = kwargs.get('inference_data')
+        
+        start_time = time.time()
+        request = client._prepare_request(
+            contents=contents,
+            generation_config=GenerationConfig(
+                temperature=self.temperature,
+            ),
+            tools=tools,
+        )
+        api_response = requests.post("http://localhost:8080/", data=request._pb.SerializeToString(), headers={'Content-Type': 'application/x-protobuf'})
+        response = json.loads(api_response.content)['response']
+        if 'DEADLINE_EXCEEDED' in response or "RESOURCE_EXHAUSTED" in response or 'OVERLOADED' in response:
+            raise ResourceExhausted(response)
+
+        content = json.loads(api_response.content)
+        raw_response = content['raw_response']
+        flattext = content['flattext']
+        inference_data["inference_input_log"]['raw_response'] = raw_response
+        inference_data["inference_input_log"]["flattext"] = flattext
+        inference_data["inference_input_log"]["request"] = type(request).serialize(request)
+
+        if api_response.status_code != 200: 
+            raise ValueError(content["response"])
+        else:
+            api_response = GenerationResponse.from_dict(json.loads(content["response"]))
+            
+        end_time = time.time()
+        
         return api_response, end_time - start_time
 
     #### FC methods ####
@@ -123,6 +153,7 @@ class GeminiHandler(BaseHandler):
             generation_config=GenerationConfig(
                 temperature=self.temperature,
             ),
+            inference_data=inference_data,
             tools=tools,
         )
 
