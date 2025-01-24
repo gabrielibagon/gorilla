@@ -299,6 +299,7 @@ class GeminiHandler(BaseHandler):
             generation_config=GenerationConfig(
                 temperature=self.temperature,
             ),
+            inference_data=inference_data            
         )
         return api_response
 
